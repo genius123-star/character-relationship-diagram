@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "人物关系图谱 · 划句解析",
+  "version": "0.1.0",
+  "description": "阅读中划选句子，解析人物关系、地理位置与人物特征，写入本地人物关系图谱。",
+  "permissions": ["sidePanel", "storage"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["contentScript.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "side_panel": {
+    "default_path": "sidepanel/index.html"
+  },
+  "action": {
+    "default_title": "人物关系图谱"
+  },
+  "commands": {
+    "open-parser": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+P"
+      },
+      "description": "打开句子解析侧边栏"
+    }
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; frame-src http://127.0.0.1:5173 http://localhost:5173 https://*;"
+  }
+}
