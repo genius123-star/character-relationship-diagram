@@ -1,0 +1,53 @@
+{
+  "name": "character-graph",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc -b --pretty false",
+    "build:extension": "node scripts/build-extension.mjs"
+  },
+  "dependencies": {
+    "@types/d3-geo": "^3.1.1",
+    "@types/topojson-client": "^3.1.5",
+    "cytoscape": "latest",
+    "d3-geo": "^3.1.1",
+    "maplibre-gl": "^6.4.0",
+    "pmtiles": "^4.5.0",
+    "react": "latest",
+    "react-dom": "latest",
+    "topojson-client": "^3.1.0",
+    "world-atlas": "^2.0.2"
+  },
+  "devDependencies": {
+    "@eslint/js": "latest",
+    "@playwright/test": "latest",
+    "@rolldown/binding-win32-x64-msvc": "^1.2.3",
+    "@testing-library/jest-dom": "latest",
+    "@testing-library/react": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "@vitejs/plugin-react": "latest",
+    "eslint": "latest",
+    "eslint-plugin-react-hooks": "latest",
+    "eslint-plugin-react-refresh": "latest",
+    "fake-indexeddb": "^6.2.5",
+    "globals": "latest",
+    "jsdom": "^27.4.0",
+    "typescript": "latest",
+    "typescript-eslint": "latest",
+    "vite": "latest",
+    "vitest": "latest"
+  },
+  "packageManager": "npm@10.2.3",
+  "engines": {
+    "node": ">=24.14.0"
+  }
+}
