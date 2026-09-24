@@ -13,6 +13,10 @@ import type { GraphExportFormat, GraphImageExporter } from "./graphImageExport";
 import { GeographyCanvas } from "../geography/GeographyCanvas";
 import { JourneyPanel } from "./JourneyPanel";
 import { SentenceParsePanel } from "./SentenceParsePanel";
+import { AiSummaryPanel } from "./AiSummaryPanel";
+import { AiSettingsFields } from "../ai/AiSettingsFields";
+import { resolveAiEndpoint, type AiConfiguration } from "../ai/aiClient";
+import { relationshipPlaceholder } from "../../domain/relationshipSemantics";
 import type { ExtensionParseTask } from "../../app/App";
 
 interface GraphWorkspaceProps {
@@ -38,11 +42,14 @@ interface GraphWorkspaceProps {
 
 export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, onGraphExport, onUndo, onRedo, canUndo = false, canRedo = false, folderPeople = [], folderRelationships = [], onAddFromFolder, onRemoveFromView, onDeleteFromFolder, extensionParseTask, onExtensionParseTaskConsumed }: GraphWorkspaceProps) {
   const [selectedId, setSelectedId] = useState<string>();
+  const [marqueePersonIds, setMarqueePersonIds] = useState<string[]>([]);
+  const [marqueeRelationshipIds, setMarqueeRelationshipIds] = useState<string[]>([]);
   const [dialog, setDialog] = useState<"person" | "relationship" | "folder">();
   const [personName, setPersonName] = useState("");
   const [sourceId, setSourceId] = useState("");
   const [targetId, setTargetId] = useState("");
-  const [relationshipLabel, setRelationshipLabel] = useState("关系");
+  const [relationshipLabel, setRelationshipLabel] = useState("");
+  const [relationshipSemanticError, setRelationshipSemanticError] = useState("");
   const [relationshipKind, setRelationshipKind] = useState<RelationshipKind>("directed");
   const [relationshipToolsOpen, setRelationshipToolsOpen] = useState(false);
   const [moreToolsOpen, setMoreToolsOpen] = useState(false);
@@ -51,6 +58,7 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
   const [editSourceId, setEditSourceId] = useState("");
   const [editTargetId, setEditTargetId] = useState("");
   const [editRelationshipKind, setEditRelationshipKind] = useState<RelationshipKind>("directed");
+  const [editRelationshipLabel, setEditRelationshipLabel] = useState("");
   const [editDescription, setEditDescription] = useState("");
   const [descriptionEdited, setDescriptionEdited] = useState(false);
   const [endpointPicking, setEndpointPicking] = useState<"source" | "target" | "calculationSource" | "calculationTarget">();
@@ -71,6 +79,13 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
   const [parseInitialSentence, setParseInitialSentence] = useState("");
   const [parseNonce, setParseNonce] = useState(0);
   const [handledParseRequestId, setHandledParseRequestId] = useState("");
+  const [summaryOpen, setSummaryOpen] = useState(false);
+  const [aiSettingsOpen, setAiSettingsOpen] = useState(false);
+  // 已保存配置仅停留在当前工作台内存，绝不写入项目或本地存储。
+  const [aiConfiguration, setAiConfiguration] = useState<AiConfiguration>({ apiKey: "", model: "deepseek-chat", baseUrl: "" });
+  const [aiConfigurationDraft, setAiConfigurationDraft] = useState<AiConfiguration>({ apiKey: "", model: "deepseek-chat", baseUrl: "" });
+  const [aiConfigurationError, setAiConfigurationError] = useState("");
+  const [aiConfigurationStatus, setAiConfigurationStatus] = useState("");
   const [calculationSourceId, setCalculationSourceId] = useState("");
   const [calculationTargetId, setCalculationTargetId] = useState("");
   const [observationEnabled, setObservationEnabled] = useState(false);
@@ -156,15 +171,16 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
   }, [canRedo, canUndo, onRedo, onUndo]);
 
   useEffect(() => {
-    if (!moreToolsOpen && !observationToolsOpen) return;
+    if (!moreToolsOpen && !observationToolsOpen && !aiSettingsOpen) return;
     const closeFloatingTools = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setMoreToolsOpen(false);
       setObservationToolsOpen(false);
+      setAiSettingsOpen(false);
     };
     document.addEventListener("keydown", closeFloatingTools);
     return () => document.removeEventListener("keydown", closeFloatingTools);
-  }, [moreToolsOpen, observationToolsOpen]);
+  }, [aiSettingsOpen, moreToolsOpen, observationToolsOpen]);
 
   if (extensionParseTask && extensionParseTask.requestId !== handledParseRequestId) {
     setHandledParseRequestId(extensionParseTask.requestId);
@@ -178,6 +194,23 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
     onExtensionParseTaskConsumed?.(handledParseRequestId);
   }, [handledParseRequestId, onExtensionParseTaskConsumed]);
 
+  const openAiSettings = () => {
+    setAiConfigurationDraft(aiConfiguration);
+    setAiConfigurationError("");
+    setAiConfigurationStatus("");
+    setAiSettingsOpen(true);
+  };
+  const saveAiConfiguration = () => {
+    const next: AiConfiguration = { apiKey: aiConfigurationDraft.apiKey.trim(), model: aiConfigurationDraft.model.trim(), baseUrl: aiConfigurationDraft.baseUrl?.trim() ?? "" };
+    if (!next.apiKey) { setAiConfigurationError("请填写 API Key 后再保存。"); return; }
+    if (!next.model) { setAiConfigurationError("请填写模型名称后再保存。"); return; }
+    try { resolveAiEndpoint(next.model, next.baseUrl); }
+    catch (error) { setAiConfigurationError(error instanceof Error ? error.message : "AI 配置格式无效。"); return; }
+    setAiConfiguration(next);
+    setAiConfigurationDraft(next);
+    setAiConfigurationError("");
+    setAiConfigurationStatus(`配置已保存：${next.model}。将在下一次 AI 操作时验证服务连接。`);
+  };
   const update = (next: ProjectDocument) => onChange({ ...next, updatedAt: new Date().toISOString() });
   const commit = (next: ProjectDocument) => onCommit
     ? onCommit({ ...next, updatedAt: new Date().toISOString() })
@@ -194,24 +227,41 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
   const addRelationship = (event: FormEvent) => {
     event.preventDefault();
     if (!sourceId || !targetId || sourceId === targetId || !relationshipLabel.trim()) return;
+    
     const relationship = createRelationship({ sourcePersonId: sourceId, targetPersonId: targetId, forwardLabel: relationshipLabel.trim(), kind: relationshipKind, symmetric: relationshipKind === "undirected" });
     update({ ...project, relationships: [...project.relationships, relationship] });
     setEditSourceId(relationship.sourcePersonId);
     setEditTargetId(relationship.targetPersonId);
+    setEditRelationshipKind(relationshipKind);
+    setEditRelationshipLabel(relationship.forwardLabel);
     setSelectedId(relationship.id);
-    setRelationshipLabel("关系");
+    setRelationshipLabel("");
+    
     setDialog(undefined);
   };
   const openRelationshipEditor = (sourcePersonId: string, targetPersonId: string) => {
     setSourceId(sourcePersonId);
     setTargetId(targetPersonId);
+    
     setDialog("relationship");
   };
   const connectFromCanvas = (sourcePersonId: string, targetPersonId: string, kind: RelationshipKind) => {
-    const relationship = createRelationship({ sourcePersonId, targetPersonId, forwardLabel: relationshipLabel.trim() || "关系", kind, symmetric: kind === "undirected" });
+    if (!relationshipLabel.trim()) {
+      setSourceId(sourcePersonId);
+      setTargetId(targetPersonId);
+      setRelationshipKind(kind);
+      
+      setDialog("relationship");
+      return;
+    }
+    
+    const relationship = createRelationship({ sourcePersonId, targetPersonId, forwardLabel: relationshipLabel.trim(), kind, symmetric: kind === "undirected" });
     update({ ...project, relationships: [...project.relationships, relationship] });
     setEditSourceId(relationship.sourcePersonId);
     setEditTargetId(relationship.targetPersonId);
+    setEditRelationshipKind(relationshipKind);
+    setEditRelationshipLabel(relationship.forwardLabel);
+    
     setSelectedId(relationship.id);
   };
   const editPersonProfile = (event: FormEvent<HTMLFormElement>) => {
@@ -327,6 +377,7 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
       update({ ...project, people: project.people.map((person) => person.id === selectedPerson.id ? { ...person, name: value, updatedAt: new Date().toISOString() } : person) });
     } else if (selectedRelationship) {
       const kind = editRelationshipKind;
+      
       const description = editDescription.trim() || undefined;
       const endpointsExist = project.people.some((person) => person.id === editSourceId) && project.people.some((person) => person.id === editTargetId);
       if (!endpointsExist || editSourceId === editTargetId) {
@@ -334,6 +385,8 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
         return;
       }
       update({ ...project, relationships: project.relationships.map((relationship) => relationship.id === selectedRelationship.id ? { ...relationship, sourcePersonId: editSourceId, targetPersonId: editTargetId, forwardLabel: value, kind, symmetric: kind === "undirected", description, updatedAt: new Date().toISOString() } : relationship) });
+      setEditRelationshipLabel(value);
+      
     }
   };
   const selectEndpoint = (personId: string) => {
@@ -344,9 +397,29 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
     }
     if (endpointPicking === "source") setEditSourceId(personId);
     if (endpointPicking === "target") setEditTargetId(personId);
-    if (selectedRelationship && !descriptionEdited) setEditDescription(calculateRelationshipDescription({ ...selectedRelationship, sourcePersonId: endpointPicking === "source" ? personId : editSourceId, targetPersonId: endpointPicking === "target" ? personId : editTargetId, kind: editRelationshipKind }, project.people));
+    if (selectedRelationship && !descriptionEdited) setEditDescription(calculateRelationshipDescription({ ...selectedRelationship, sourcePersonId: endpointPicking === "source" ? personId : editSourceId, targetPersonId: endpointPicking === "target" ? personId : editTargetId, forwardLabel: editRelationshipLabel, kind: editRelationshipKind }, project.people));
     setEndpointPicking(undefined);
     setEndpointError("");
+  };
+  const handleMarqueeSelect = (personIds: string[], relationshipIds: string[], additive = false) => {
+    setSelectedId(undefined);
+    setMarqueePersonIds((current) => additive ? [...new Set([...current, ...personIds])] : personIds);
+    setMarqueeRelationshipIds((current) => additive ? [...new Set([...current, ...relationshipIds])] : relationshipIds);
+  };
+  const clearMarqueeSelection = () => {
+    setMarqueePersonIds([]);
+    setMarqueeRelationshipIds([]);
+  };
+  const deleteMarqueeSelection = () => {
+    const people = new Set(marqueePersonIds);
+    const explicitRelationships = new Set(marqueeRelationshipIds);
+    const dependentRelationships = project.relationships.filter((relationship) => people.has(relationship.sourcePersonId) || people.has(relationship.targetPersonId));
+    const relationshipIds = new Set([...explicitRelationships, ...dependentRelationships.map((relationship) => relationship.id)]);
+    if (!people.size && !relationshipIds.size) return;
+    const message = `将删除 ${people.size} 个人物和 ${relationshipIds.size} 条关系（其中 ${dependentRelationships.length} 条因人物删除而连带移除）。此操作可通过撤销恢复。`;
+    if (!window.confirm(message)) return;
+    update({ ...project, people: project.people.filter((person) => !people.has(person.id)), relationships: project.relationships.filter((relationship) => !relationshipIds.has(relationship.id)) });
+    clearMarqueeSelection();
   };
   const handleCanvasSelect = (id?: string) => {
     if (endpointPicking === "calculationSource" || endpointPicking === "calculationTarget") {
@@ -371,6 +444,8 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
       setEditTargetId(relationship.targetPersonId);
       const kind = relationship.kind ?? (relationship.symmetric ? "undirected" : "directed");
       setEditRelationshipKind(kind);
+      setEditRelationshipLabel(relationship.forwardLabel);
+      
       setEditDescription(relationship.description || calculateRelationshipDescription(relationship, project.people));
       setDescriptionEdited(Boolean(relationship.description));
       setEndpointError("");
@@ -400,11 +475,14 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
             <button className="icon-button" type="button" aria-label="重做" title="重做（Ctrl+Y）" disabled={!canRedo} onClick={onRedo}>↷</button>
           </div>
           {(onExport || onGraphExport) && <button className="button button--ghost" type="button" onClick={() => setExportDialogOpen(true)}>导出项目</button>}
+          <button className="button button--ghost" type="button" aria-label="AI 配置" aria-expanded={aiSettingsOpen} onClick={openAiSettings}>AI 配置</button>
           <div className="toolbar-more">
             <button className="button button--ghost toolbar-more__toggle" type="button" aria-label="更多功能" aria-expanded={moreToolsOpen} onClick={() => setMoreToolsOpen((open) => !open)}>更多⌄</button>
             {moreToolsOpen && <div className="toolbar-more__menu" role="menu">
               <button type="button" role="menuitem" onClick={() => { setParseOpen((open) => !open); setMoreToolsOpen(false); }}>句子解析</button>
+              {project.graphType !== "journey" && <button type="button" role="menuitem" onClick={() => { setParseOpen(true); setMoreToolsOpen(false); }}>AI 智能解析</button>}
               {onAddFromFolder && <button type="button" role="menuitem" disabled={previewMode} onClick={() => { setFolderPersonIds([]); setFolderRelationshipIds([]); setDialog("folder"); setMoreToolsOpen(false); }}>从文件夹加入</button>}
+              {project.graphType === "people" && <button type="button" role="menuitem" onClick={() => { setSummaryOpen(true); setMoreToolsOpen(false); }}>AI 关系总结</button>}
               <button type="button" role="menuitem" aria-label={previewMode ? "退出预览模式" : "开启预览模式"} onClick={() => { setPreviewMode((current) => !current); setSelectedId(undefined); setMoreToolsOpen(false); }}>{previewMode ? "退出预览" : "预览模式"}</button>
               <button type="button" role="menuitem" aria-label="重新布局" onClick={() => { setLayoutAction({ kind: "relayout", nonce: Date.now() }); setMoreToolsOpen(false); }}>重新布局</button>
               <button type="button" role="menuitem" aria-label="适应全图" onClick={() => { setLayoutAction({ kind: "fit", nonce: Date.now() }); setMoreToolsOpen(false); }}>适应全图</button>
@@ -445,15 +523,23 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
         {!previewMode && <button className={`relationship-tools-toggle ${relationshipToolsOpen ? "is-open" : ""}`} type="button" aria-label={relationshipToolsOpen ? "关闭关系工具" : "打开关系工具"} title="关系工具" onClick={() => setRelationshipToolsOpen((open) => !open)}>↗</button>}
         {!previewMode && relationshipToolsOpen && <div className="relationship-tools relationship-tools--floating" aria-label="关系工具">
           <button className="relationship-tools__close" type="button" aria-label="关闭关系工具" onClick={() => setRelationshipToolsOpen(false)}>×</button>
-          <div><label htmlFor="new-relationship-kind">新关系类型</label><select id="new-relationship-kind" value={relationshipKind} onChange={(event) => setRelationshipKind(event.target.value as RelationshipKind)}><option value="directed">单向关系 →</option><option value="bidirectional">双向关系 ⮂</option><option value="undirected">共同关系 —</option><option value="contact">曾有联系 ┄</option></select></div>
-          <div><label htmlFor="new-relationship-name">新关系名称</label><input id="new-relationship-name" value={relationshipLabel} onChange={(event) => setRelationshipLabel(event.target.value)} /></div>
+          <div><label htmlFor="new-relationship-kind">新关系类型</label><select id="new-relationship-kind" value={relationshipKind} onChange={(event) => { const kind = event.target.value as RelationshipKind; setRelationshipKind(kind);  }}><option value="directed">单向关系 →</option><option value="bidirectional">双向关系 ⮂</option><option value="undirected">共同关系 —</option><option value="contact">曾有联系 ┄</option></select></div>
+          <div><label htmlFor="new-relationship-name">新关系名称</label><input id="new-relationship-name" value={relationshipLabel} placeholder={relationshipPlaceholder(relationshipKind)} onChange={(event) => { setRelationshipLabel(event.target.value);  }} /></div>
           <div><label htmlFor="relationship-preview">分类预览</label><select id="relationship-preview" value={previewKind} onChange={(event) => setPreviewKind(event.target.value as RelationshipKind | "all")}><option value="all">全部关系</option><option value="directed">单向关系</option><option value="bidirectional">双向关系</option><option value="undirected">共同关系</option><option value="contact">曾有联系</option></select></div>
           <p>右键人物开始连线，再次右键目标完成；左键取消。</p>
         </div>}
         {project.graphType !== "geography" && project.people.length === 0 && <div className="canvas-empty"><div className="empty-projects__symbol">◇</div><h2>从第一个人物开始</h2><p>添加人物后，节点会出现在这张关系图中。</p><button className="button button--primary" type="button" onClick={() => setDialog("person")}>添加人物</button></div>}
-        {project.graphType === "people" ? <GraphCanvas project={project} selectedId={selectedId} previewKind={previewKind} relationshipKind={relationshipKind} endpointPicking={Boolean(endpointPicking)} avatarUrls={avatarUrls} nodeColors={nodeColors} previewMode={previewMode} focusPersonIds={focusedPath?.personIds ?? focusPersonIds} focusRelationshipIds={focusedPath?.relationshipIds} observationChapter={observationEnabled ? observationChapter : undefined} layoutAction={layoutAction} onLayoutChange={(layout) => update({ ...project, layout })} onExporterReady={setGraphExporter} onSelect={handleCanvasSelect} onConnect={connectFromCanvas} onMove={(personId, x, y) => update({ ...project, layout: { ...project.layout, [personId]: { x, y, fixed: false } } })} /> : <GeographyCanvas project={project} selectedId={selectedId} onSelect={handleCanvasSelect} onConnect={connectFromCanvas} relationshipKind={relationshipKind} onPersonGeoChange={(personId, geo) => update({ ...project, people: project.people.map((person) => person.id === personId ? { ...person, geo, updatedAt: new Date().toISOString() } : person) })} focusPersonIds={focusPersonIds} observationChapter={observationEnabled ? observationChapter : undefined} journeyStops={project.graphType === "journey" ? project.journey?.stops : undefined} selectedStopId={journeyStopId} onSelectStop={setJourneyStopId} />}
-        {project.graphType === "journey" && <JourneyPanel project={project} observationChapter={observationChapter} selectedStopId={journeyStopId} onChange={update} onSelectStop={setJourneyStopId} onFocusPerson={(personId) => setSearchFocusId(personId)} />}
-        {parseOpen && <SentenceParsePanel key={parseNonce} project={project} initialSentence={parseInitialSentence} onApply={commit} onClose={() => setParseOpen(false)} />}
+        {project.graphType === "people" ? <GraphCanvas project={project} selectedId={selectedId} previewKind={previewKind} relationshipKind={relationshipKind} endpointPicking={Boolean(endpointPicking)} avatarUrls={avatarUrls} nodeColors={nodeColors} previewMode={previewMode} focusPersonIds={focusedPath?.personIds ?? focusPersonIds} focusRelationshipIds={focusedPath?.relationshipIds} observationChapter={observationEnabled ? observationChapter : undefined} layoutAction={layoutAction} onLayoutChange={(layout) => update({ ...project, layout })} onExporterReady={setGraphExporter} onSelect={handleCanvasSelect} onConnect={connectFromCanvas} onMarqueeSelect={handleMarqueeSelect} marqueePersonIds={marqueePersonIds} marqueeRelationshipIds={marqueeRelationshipIds} onMove={(personId, x, y) => update({ ...project, layout: { ...project.layout, [personId]: { x, y, fixed: false } } })} /> : <GeographyCanvas project={project} selectedId={selectedId} onSelect={handleCanvasSelect} onConnect={connectFromCanvas} onMarqueeSelect={handleMarqueeSelect} relationshipKind={relationshipKind} onPersonGeoChange={(personId, geo) => update({ ...project, people: project.people.map((person) => person.id === personId ? { ...person, geo, updatedAt: new Date().toISOString() } : person) })} focusPersonIds={focusPersonIds} observationChapter={observationEnabled ? observationChapter : undefined} journeyStops={project.graphType === "journey" ? project.journey?.stops : undefined} selectedStopId={journeyStopId} onSelectStop={setJourneyStopId} />}
+        {(marqueePersonIds.length > 0 || marqueeRelationshipIds.length > 0) && <div className="batch-selection-bar" role="status"><span>已选择 {marqueePersonIds.length} 个人物、{marqueeRelationshipIds.length} 条关系</span><button className="button button--ghost" type="button" onClick={clearMarqueeSelection}>取消选择</button><button className="button danger-button" type="button" onClick={deleteMarqueeSelection}>批量删除</button></div>}        {project.graphType === "journey" && <JourneyPanel project={project} observationChapter={observationChapter} selectedStopId={journeyStopId} onChange={update} onSelectStop={setJourneyStopId} onFocusPerson={(personId) => setSearchFocusId(personId)} />}
+        {aiSettingsOpen && <aside className="parse-panel ai-settings-panel" aria-label="AI 配置">
+          <header className="parse-panel__header"><h3>AI 配置</h3><button type="button" aria-label="关闭 AI 配置" onClick={() => setAiSettingsOpen(false)}>×</button></header>
+          <p className="parse-panel__note">填写一次后可直接用于 AI 解析和 AI 关系总结；配置只保留在当前工作台，不写入项目。</p>
+          <AiSettingsFields configuration={aiConfigurationDraft} onChange={setAiConfigurationDraft} idPrefix="workspace-ai" />
+          {aiConfigurationError && <p className="form-error" role="alert">{aiConfigurationError}</p>}
+          {aiConfigurationStatus && <p className="parse-panel__done" role="status">{aiConfigurationStatus}</p>}
+          <div className="parse-panel__actions"><button className="button button--primary" type="button" onClick={saveAiConfiguration}>保存配置</button></div>        </aside>}
+        {parseOpen && <SentenceParsePanel key={parseNonce} project={project} initialSentence={parseInitialSentence} aiConfiguration={aiConfiguration} onApply={commit} onClose={() => setParseOpen(false)} />}
+        {summaryOpen && project.graphType === "people" && <AiSummaryPanel project={project} aiConfiguration={aiConfiguration} initialPersonId={selectedPerson?.id} initialRelationshipId={selectedRelationship?.id} onClose={() => setSummaryOpen(false)} />}
       </section>
       {selectedId && <aside className="detail-panel" data-testid="detail-panel">
         <button className="detail-close" type="button" aria-label="关闭详细信息" onClick={() => { if (selectedRelationship && detailFormRef.current) detailFormRef.current.requestSubmit(); setSelectedId(undefined); }}>×</button>
@@ -462,12 +548,12 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
         {selectedPerson && <button className="button button--ghost node-pin-button" type="button" onClick={toggleSelectedPersonFixed}>{project.layout[selectedPerson.id]?.fixed ? "取消固定" : "固定节点"}</button>}
         <form className="detail-edit" ref={detailFormRef} onSubmit={editSelected}>
           <label htmlFor="selected-name">{selectedPerson ? "编辑人物名称" : "编辑关系名称"}</label>
-          <div><input id="selected-name" name={selectedPerson ? "profile-name" : "selected-name"} form={selectedPerson ? "person-profile-form" : undefined} key={selectedPerson?.name ?? selectedRelationship?.forwardLabel} defaultValue={selectedPerson?.name ?? selectedRelationship?.forwardLabel} /></div>
-          {selectedRelationship && <><label htmlFor="selected-kind">编辑关系类型</label><select id="selected-kind" name="selected-kind" value={editRelationshipKind} onChange={(event) => { const kind = event.target.value as RelationshipKind; setEditRelationshipKind(kind); if (!descriptionEdited) setEditDescription(calculateRelationshipDescription({ ...selectedRelationship, sourcePersonId: editSourceId, targetPersonId: editTargetId, kind }, project.people)); }}><option value="directed">单向关系 →</option><option value="bidirectional">双向关系 ⮂</option><option value="undirected">共同关系 —</option><option value="contact">曾有联系 ┄</option></select></>}
-          {selectedRelationship && <div className="endpoint-editor"><EndpointPicker key={`source-${editSourceId}`} id="selected-source" label="起点人物" people={project.people} value={editSourceId} onChange={(id) => { setEditSourceId(id); setEndpointError(id === editTargetId ? "起点与终点不能是同一个人物" : ""); if (!descriptionEdited) setEditDescription(calculateRelationshipDescription({ ...selectedRelationship, sourcePersonId: id, targetPersonId: editTargetId, kind: editRelationshipKind }, project.people)); }} /><button className={`button button--ghost ${endpointPicking === "source" ? "is-active" : ""}`} type="button" aria-label="从画布选择起点" onClick={() => { setEndpointPicking("source"); setEndpointError(""); }}>👆 点击选择</button><EndpointPicker key={`target-${editTargetId}`} id="selected-target" label="终点人物" people={project.people} value={editTargetId} onChange={(id) => { setEditTargetId(id); setEndpointError(id === editSourceId ? "起点与终点不能是同一个人物" : ""); if (!descriptionEdited) setEditDescription(calculateRelationshipDescription({ ...selectedRelationship, sourcePersonId: editSourceId, targetPersonId: id, kind: editRelationshipKind }, project.people)); }} /><button className={`button button--ghost ${endpointPicking === "target" ? "is-active" : ""}`} type="button" aria-label="从画布选择终点" onClick={() => { setEndpointPicking("target"); setEndpointError(""); }}>👆 点击选择</button></div>}
+          <div><input id="selected-name" name={selectedPerson ? "profile-name" : "selected-name"} form={selectedPerson ? "person-profile-form" : undefined} key={selectedPerson?.name} value={selectedPerson ? undefined : editRelationshipLabel} defaultValue={selectedPerson?.name} placeholder={selectedRelationship ? relationshipPlaceholder(editRelationshipKind) : undefined} onChange={selectedPerson ? () => undefined : (event) => { const label = event.target.value; setEditRelationshipLabel(label);  if (!descriptionEdited) setEditDescription(calculateRelationshipDescription({ ...selectedRelationship!, sourcePersonId: editSourceId, targetPersonId: editTargetId, forwardLabel: label, kind: editRelationshipKind }, project.people)); }} /></div>
+          {selectedRelationship && <><label htmlFor="selected-kind">编辑关系类型</label><select id="selected-kind" name="selected-kind" value={editRelationshipKind} onChange={(event) => { const kind = event.target.value as RelationshipKind; setEditRelationshipKind(kind);  if (!descriptionEdited) setEditDescription(calculateRelationshipDescription({ ...selectedRelationship, sourcePersonId: editSourceId, targetPersonId: editTargetId, forwardLabel: editRelationshipLabel, kind }, project.people)); }}><option value="directed">单向关系 →</option><option value="bidirectional">双向关系 ⮂</option><option value="undirected">共同关系 —</option><option value="contact">曾有联系 ┄</option></select></>}
+          {selectedRelationship && <div className="endpoint-editor"><EndpointPicker key={`source-${editSourceId}`} id="selected-source" label="起点人物" people={project.people} value={editSourceId} onChange={(id) => { setEditSourceId(id); setEndpointError(id === editTargetId ? "起点与终点不能是同一个人物" : ""); if (!descriptionEdited) setEditDescription(calculateRelationshipDescription({ ...selectedRelationship, sourcePersonId: id, targetPersonId: editTargetId, forwardLabel: editRelationshipLabel, kind: editRelationshipKind }, project.people)); }} /><button className={`button button--ghost ${endpointPicking === "source" ? "is-active" : ""}`} type="button" aria-label="从画布选择起点" onClick={() => { setEndpointPicking("source"); setEndpointError(""); }}>👆 点击选择</button><EndpointPicker key={`target-${editTargetId}`} id="selected-target" label="终点人物" people={project.people} value={editTargetId} onChange={(id) => { setEditTargetId(id); setEndpointError(id === editSourceId ? "起点与终点不能是同一个人物" : ""); if (!descriptionEdited) setEditDescription(calculateRelationshipDescription({ ...selectedRelationship, sourcePersonId: editSourceId, targetPersonId: id, forwardLabel: editRelationshipLabel, kind: editRelationshipKind }, project.people)); }} /><button className={`button button--ghost ${endpointPicking === "target" ? "is-active" : ""}`} type="button" aria-label="从画布选择终点" onClick={() => { setEndpointPicking("target"); setEndpointError(""); }}>👆 点击选择</button></div>}
           {selectedRelationship && <><label htmlFor="selected-description">关系说明</label><textarea id="selected-description" name="selected-description" value={editDescription} onChange={(event) => { setEditDescription(event.target.value); setDescriptionEdited(true); }} rows={4} /></>}
           {selectedRelationship && endpointPicking && <p className="endpoint-hint">请在画布中点击一个人物节点作为{endpointPicking === "source" ? "起点" : "终点"}</p>}
-          {selectedRelationship && endpointError && <p className="form-error" role="alert">{endpointError}</p>}
+          {selectedRelationship && endpointError && <p className="form-error" role="alert">{endpointError}</p>}{selectedRelationship && relationshipSemanticError && <p className="form-hint" role="status">{relationshipSemanticError}</p>}
           {selectedRelationship && <button className="button button--ghost" type="submit" disabled={!editSourceId || !editTargetId || editSourceId === editTargetId}>保存修改</button>}
         </form>
         {selectedPerson ? <form id="person-profile-form" className="profile-form profile-block-stack" onSubmit={editPersonProfile}>
@@ -482,7 +568,7 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
       </aside>}
 
       {dialog === "person" && <Dialog title="添加人物" onClose={() => setDialog(undefined)}><form onSubmit={addPerson}><label htmlFor="person-name">人物名称</label><input id="person-name" autoFocus value={personName} onChange={(event) => setPersonName(event.target.value)} /><div className="dialog-actions"><button className="button button--ghost" type="button" onClick={() => setDialog(undefined)}>取消</button><button className="button button--primary" type="submit" disabled={!personName.trim()}>保存人物</button></div></form></Dialog>}
-      {dialog === "relationship" && <Dialog title="编辑关系" onClose={() => setDialog(undefined)}><form onSubmit={addRelationship}><label htmlFor="relation-kind">关系类型</label><select id="relation-kind" value={relationshipKind} onChange={(event) => setRelationshipKind(event.target.value as RelationshipKind)}><option value="directed">单向关系</option><option value="bidirectional">双向关系</option><option value="undirected">共同关系</option><option value="contact">曾有联系</option></select><label htmlFor="relation-source">起始人物</label><select id="relation-source" value={sourceId} onChange={(event) => setSourceId(event.target.value)}>{project.people.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select><label htmlFor="relation-target">目标人物</label><select id="relation-target" value={targetId} onChange={(event) => setTargetId(event.target.value)}>{project.people.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select><label htmlFor="relation-label">关系名称</label><input id="relation-label" value={relationshipLabel} onChange={(event) => setRelationshipLabel(event.target.value)} placeholder="例如：朋友、父子、师生" /><p className="relationship-summary">{relationshipSentence(project, sourceId, targetId, relationshipLabel || "……", relationshipKind)}</p><div className="dialog-actions"><button className="button button--ghost" type="button" onClick={() => setDialog(undefined)}>取消</button><button className="button button--primary" type="submit" disabled={!sourceId || !targetId || sourceId === targetId || !relationshipLabel.trim()}>保存关系</button></div></form></Dialog>}
+      {dialog === "relationship" && <Dialog title="编辑关系" onClose={() => setDialog(undefined)}><form onSubmit={addRelationship}><label htmlFor="relation-kind">关系类型</label><select id="relation-kind" value={relationshipKind} onChange={(event) => { const kind = event.target.value as RelationshipKind; setRelationshipKind(kind);  }}><option value="directed">单向关系</option><option value="bidirectional">双向关系</option><option value="undirected">共同关系</option><option value="contact">曾有联系</option></select><label htmlFor="relation-source">起始人物</label><select id="relation-source" value={sourceId} onChange={(event) => setSourceId(event.target.value)}>{project.people.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select><label htmlFor="relation-target">目标人物</label><select id="relation-target" value={targetId} onChange={(event) => setTargetId(event.target.value)}>{project.people.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}</select><label htmlFor="relation-label">关系名称</label><input id="relation-label" value={relationshipLabel} onChange={(event) => { setRelationshipLabel(event.target.value);  }} placeholder={relationshipPlaceholder(relationshipKind)} /><p className="relationship-summary">{relationshipSentence(project, sourceId, targetId, relationshipLabel || "……", relationshipKind)}</p><div className="dialog-actions"><button className="button button--ghost" type="button" onClick={() => setDialog(undefined)}>取消</button><button className="button button--primary" type="submit" disabled={!sourceId || !targetId || sourceId === targetId || !relationshipLabel.trim()}>保存关系</button></div></form></Dialog>}
       {dialog === "folder" && <Dialog title="从当前文件夹加入" onClose={() => setDialog(undefined)}><div className="folder-member-picker"><p>选择要加入当前图的人物与关系。加入关系时会自动加入其起点和终点人物。</p><div className="folder-member-picker__scroll"><h3>人物</h3>{folderPeople.filter((person) => !project.people.some((current) => current.id === person.id)).map((person) => <label key={person.id}><input type="checkbox" checked={folderPersonIds.includes(person.id)} onChange={(event) => setFolderPersonIds((current) => event.target.checked ? [...current, person.id] : current.filter((id) => id !== person.id))} />{person.name}</label>)}<h3>关系</h3>{folderRelationships.filter((relationship) => !project.relationships.some((current) => current.id === relationship.id)).map((relationship) => { const source = folderPeople.find((person) => person.id === relationship.sourcePersonId)?.name ?? "未知人物"; const target = folderPeople.find((person) => person.id === relationship.targetPersonId)?.name ?? "未知人物"; return <label key={relationship.id}><input type="checkbox" checked={folderRelationshipIds.includes(relationship.id)} onChange={(event) => setFolderRelationshipIds((current) => event.target.checked ? [...current, relationship.id] : current.filter((id) => id !== relationship.id))} />{source} · {relationship.forwardLabel} · {target}</label>; })}</div><div className="dialog-actions folder-member-picker__footer"><button className="button button--ghost" type="button" onClick={() => setDialog(undefined)}>取消</button><button className="button button--primary" type="button" disabled={!folderPersonIds.length && !folderRelationshipIds.length} onClick={() => { onAddFromFolder?.(folderPersonIds, folderRelationshipIds); setDialog(undefined); }}>加入当前图</button></div></div></Dialog>}
       {exportDialogOpen && <Dialog title="导出项目" onClose={() => setExportDialogOpen(false)}><div className="export-format-grid"><p>JSON 可恢复全部资料；图片与 PDF 导出包含全部节点和关系的完整图谱。</p>{onExport && <button className="button button--ghost" type="button" onClick={() => { setExportDialogOpen(false); setExportStatus("正在导出…"); void onExport(project).then(() => setExportStatus("导出完成")).catch((reason: unknown) => setExportStatus(reason instanceof Error ? reason.message : "导出失败")); }}>JSON 完整备份</button>}{([['png', 'PNG 图片'], ['jpg', 'JPG 图片'], ['pdf', 'PDF 文档']] as const).map(([format, label]) => <button className="button button--ghost" type="button" key={format} disabled={!graphExporter || !onGraphExport || project.people.length === 0} onClick={() => { if (!graphExporter || !onGraphExport) return; setExportDialogOpen(false); setExportStatus("正在导出…"); void onGraphExport(format, graphExporter).then(() => setExportStatus("导出完成")).catch((reason: unknown) => setExportStatus(reason instanceof Error ? reason.message : "导出失败")); }}>{label}</button>)}</div></Dialog>}
     </main>
@@ -492,7 +578,10 @@ export function GraphWorkspace({ project, onBack, onChange, onCommit, onExport, 
 function relationshipSentence(project: ProjectDocument, sourceId: string, targetId: string, label: string, kind: RelationshipKind): string {
   const source = project.people.find((person) => person.id === sourceId)?.name ?? "起始人物";
   const target = project.people.find((person) => person.id === targetId)?.name ?? "目标人物";
-  return kind === "undirected" || kind === "contact" ? `${source}与${target}是${label}关系` : `${source}是${target}的${label}`;
+  if (kind === "directed") return `${source}是${target}的${label}`;
+  if (kind === "bidirectional") return `${source}与${target}是${label}关系（双向对应）`;
+  if (kind === "undirected") return `${source}与${target}是${label}关系（共同关系）`;
+  return `${source}与${target}${label}`;
 }
 
 function splitList(value?: string): string[] {
