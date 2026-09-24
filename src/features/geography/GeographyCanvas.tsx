@@ -343,6 +343,7 @@ interface GeographyCanvasProps {
   selectedId?: string;
   onSelect: (id?: string) => void;
   onConnect?: (sourcePersonId: string, targetPersonId: string, kind: RelationshipKind) => void;
+  onMarqueeSelect?: (personIds: string[], relationshipIds: string[], additive?: boolean) => void;
   relationshipKind?: RelationshipKind;
   onPersonGeoChange?: (personId: string, geo: PersonGeo | undefined) => void;
   focusPersonIds?: string[];
@@ -357,6 +358,7 @@ export function GeographyCanvas({
   selectedId: _selectedId,
   onSelect: _onSelect,
   onConnect: _onConnect,
+  onMarqueeSelect: _onMarqueeSelect,
   relationshipKind: _relationshipKind,
   onPersonGeoChange: _onPersonGeoChange,
   focusPersonIds = [],
@@ -370,7 +372,7 @@ export function GeographyCanvas({
   const handleRef = useRef<MapKernelHandle | null>(null);
   const connectionSourceIdRef = useRef<string | undefined>(undefined);
   const connectionSourceLocationRef = useRef<[number, number] | undefined>(undefined);
-  const latestRef = useRef({ computeBounds: undefined as (() => [number, number, number, number] | undefined) | undefined, onSelect: _onSelect, onConnect: _onConnect, relationshipKind: _relationshipKind, onPersonGeoChange: _onPersonGeoChange, onSelectStop: _onSelectStop });
+  const latestRef = useRef({ computeBounds: undefined as (() => [number, number, number, number] | undefined) | undefined, onSelect: _onSelect, onConnect: _onConnect, onMarqueeSelect: _onMarqueeSelect, relationshipKind: _relationshipKind, onPersonGeoChange: _onPersonGeoChange, onSelectStop: _onSelectStop });
 
   const [viewLevel, setViewLevel] = useState<GeographyViewLevel>("global");
   const [zoomLevel, setZoomLevel] = useState(0.8);
@@ -389,7 +391,7 @@ export function GeographyCanvas({
   const [geoResolveState, setGeoResolveState] = useState<Record<string, "resolving" | "error">>({});
   const [candidatesByPerson, setCandidatesByPerson] = useState<Record<string, GeocodeCandidate[]>>({});
   const [geoRetryNonce, setGeoRetryNonce] = useState(0);
-  const geoAttemptedRef = useRef(new Set<string>());
+  const geoAttemptedRef = useRef(new Map<string, string>());
   const observationState = useMemo(
     () => (observationChapter === undefined ? undefined : getObservationState(project, observationChapter)),
     [project, observationChapter],
@@ -434,23 +436,67 @@ export function GeographyCanvas({
 
   // 每次渲染后把最新回调/计算函数同步到 ref，供 map 的长生命周期监听读取。
   useEffect(() => {
-    latestRef.current = { computeBounds, onSelect: _onSelect, onConnect: _onConnect, relationshipKind: _relationshipKind, onPersonGeoChange: _onPersonGeoChange, onSelectStop: _onSelectStop };
+    latestRef.current = { computeBounds, onSelect: _onSelect, onConnect: _onConnect, onMarqueeSelect: _onMarqueeSelect, relationshipKind: _relationshipKind, onPersonGeoChange: _onPersonGeoChange, onSelectStop: _onSelectStop };
   });
 
-  // 未匹配人物：有“地区/势力”但无法解析出坐标的人物，放进待匹配托盘。
+  // 右键从空白处拖动：使用屏幕坐标框选地图上的人物；右键点人物仍交给地图的连线处理。
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    const box = document.createElement("div");
+    box.className = "graph-marquee";
+    box.style.cssText = "position:absolute;display:none;pointer-events:none;z-index:8;border:1px dashed #6157d8;background:rgb(97 87 216 / 10%)";
+    container.append(box);
+    let start: { x: number; y: number } | undefined;
+    let additive = false;
+    const point = (event: PointerEvent) => { const rect = container.getBoundingClientRect(); return { x: event.clientX - rect.left, y: event.clientY - rect.top }; };
+    const suppressContextMenu = (event: MouseEvent) => {
+      // Keep MapLibre's own contextmenu event flowing for right-click connections,
+      // while disabling Chromium's native context menu.
+      event.preventDefault();
+    };
+    const down = (event: PointerEvent) => {
+      if (event.button !== 2) return;
+      const map = mapRef.current; const next = point(event);
+      const hit = map?.queryRenderedFeatures?.([next.x, next.y], { layers: ["geography-people"] }) ?? [];
+      if (hit.length) return;
+      event.preventDefault(); event.stopPropagation();
+      additive = event.ctrlKey;
+      start = next; box.style.left = `${next.x}px`; box.style.top = `${next.y}px`; box.style.width = "0px"; box.style.height = "0px"; box.style.display = "block";
+    };
+    const move = (event: PointerEvent) => {
+      if (!start) return;
+      const next = point(event); box.style.left = `${Math.min(start.x, next.x)}px`; box.style.top = `${Math.min(start.y, next.y)}px`; box.style.width = `${Math.abs(next.x - start.x)}px`; box.style.height = `${Math.abs(next.y - start.y)}px`;
+    };
+    const up = (event: PointerEvent) => {
+      if (!start) return;
+      const end = point(event); const left = Math.min(start.x, end.x); const right = Math.max(start.x, end.x); const top = Math.min(start.y, end.y); const bottom = Math.max(start.y, end.y);
+      const moved = Math.hypot(end.x - start.x, end.y - start.y) >= 8; start = undefined; box.style.display = "none";
+      if (!moved) { additive = false; return; }
+      const map = mapRef.current;
+      const personIds = project.people.flatMap((person) => { const location = resolvedLocationFor(person); if (!map || !location) return []; const screen = map.project([location.longitude, location.latitude]); return screen.x >= left && screen.x <= right && screen.y >= top && screen.y <= bottom ? [person.id] : []; });
+      const people = new Set(personIds);
+      const relationshipIds = project.relationships.filter((relationship) => people.has(relationship.sourcePersonId) && people.has(relationship.targetPersonId)).map((relationship) => relationship.id);
+      latestRef.current.onMarqueeSelect?.(personIds, relationshipIds, additive);
+      additive = false;
+    };
+    container.addEventListener("pointerdown", down, true); window.addEventListener("pointermove", move, true); window.addEventListener("pointerup", up, true); document.addEventListener("contextmenu", suppressContextMenu, true);
+    return () => { container.removeEventListener("pointerdown", down, true); window.removeEventListener("pointermove", move, true); window.removeEventListener("pointerup", up, true); document.removeEventListener("contextmenu", suppressContextMenu, true); box.remove(); };
+  }, [project.people, project.relationships]);
+  // 未匹配人物：未提供地点或地点尚不能解析为坐标的人物，都必须在待匹配托盘中可见。
   const unmatchedPeople = useMemo(
-    () => project.people.filter((person) => person.affiliation && !person.geo && !resolveKnownPlace(person.affiliation)),
+    () => project.people.filter((person) => !person.geo && !resolveKnownPlace(person.affiliation)),
     [project.people],
   );
 
   // 自动解析：已填地区但尚无确认坐标的人物。本地已知地点同步落点（auto）；
   // 未知地点联网解析，唯一结果自动落点（auto），多个同名结果保留候选待确认，
-  // 解析失败进入"解析失败·重试"。geoAttemptedRef 防止每次重渲染重复解析。
+  // 解析失败进入"解析失败·重试"。同一地点文本只解析一次；地点被更正后会重新解析。
   const scheduleGeoResolve = useCallback(() => {
     let cancelled = false;
     for (const person of project.people) {
-      if (!person.affiliation || person.geo || geoAttemptedRef.current.has(person.id)) continue;
-      geoAttemptedRef.current.add(person.id);
+      if (!person.affiliation || person.geo || geoAttemptedRef.current.get(person.id) === person.affiliation) continue;
+      geoAttemptedRef.current.set(person.id, person.affiliation);
       const known = resolveKnownPlace(person.affiliation);
       if (known) {
         latestRef.current.onPersonGeoChange?.(person.id, { ...known, status: "auto" });
@@ -1088,10 +1134,10 @@ export function GeographyCanvas({
               return (
                 <div key={person.id} className={`geography-unmatched__item ${_selectedId === person.id ? "is-selected" : ""}`} onClick={() => _onSelect(person.id)}>
                   <span>{person.name}</span>
-                  {resolveState !== "error" && !candidates && <em>解析中…</em>}
-                  {resolveState === "error" && <button className="button button--ghost" type="button" onClick={(event) => { event.stopPropagation(); retryResolve(person.id); }}>重试</button>}
-                  {candidates && <div className="geography-candidates">{candidates.map((candidate) => <button key={`${candidate.longitude},${candidate.latitude},${candidate.displayName ?? candidate.label}`} className="button button--ghost" type="button" onClick={(event) => { event.stopPropagation(); confirmCandidate(person, candidate); }}>{candidate.label}{candidate.displayName ? <span>{candidate.displayName}</span> : null}</button>)}</div>}
-                </div>
+                  {!person.affiliation && <em>未提供地点；请在人物资料填写地区/势力后自动匹配。</em>}
+                  {person.affiliation && resolveState !== "error" && !candidates && <em>解析中…</em>}
+                  {person.affiliation && resolveState === "error" && <button className="button button--ghost" type="button" onClick={(event) => { event.stopPropagation(); retryResolve(person.id); }}>重试</button>}
+                  {person.affiliation && candidates && <div className="geography-candidates">{candidates.map((candidate) => <button key={`${candidate.longitude},${candidate.latitude},${candidate.displayName ?? candidate.label}`} className="button button--ghost" type="button" onClick={(event) => { event.stopPropagation(); confirmCandidate(person, candidate); }}>{candidate.label}{candidate.displayName ? <span>{candidate.displayName}</span> : null}</button>)}</div>}</div>
               );
             })}
           </div>
