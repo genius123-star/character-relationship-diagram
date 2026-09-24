@@ -33,6 +33,10 @@ export interface ParseRelationshipCandidate {
   status: ParseCandidateStatus;
   confidence: number;
   evidence: ParseEvidence[];
+  /** AI 无法从原文确认角色或方向时为 true；确认前必须由用户核对。 */
+  needsConfirmation?: boolean;
+  /** 需要用户补充或核对的具体原因。 */
+  clarification?: string;
 }
 
 export interface ParseFeatureCandidate {
