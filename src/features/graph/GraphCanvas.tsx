@@ -11,6 +11,9 @@ interface GraphCanvasProps {
   onSelect: (id?: string) => void;
   onMove: (personId: string, x: number, y: number) => void;
   onConnect: (sourcePersonId: string, targetPersonId: string, kind: RelationshipKind) => void;
+  onMarqueeSelect?: (personIds: string[], relationshipIds: string[], additive?: boolean) => void;
+  marqueePersonIds?: string[];
+  marqueeRelationshipIds?: string[];
   previewKind: RelationshipKind | "all";
   relationshipKind: RelationshipKind;
   endpointPicking?: boolean;
@@ -25,24 +28,26 @@ interface GraphCanvasProps {
   onExporterReady?: (exporter?: GraphImageExporter) => void;
 }
 
-export function GraphCanvas({ project, selectedId, onSelect, onMove, onConnect, previewKind, relationshipKind, endpointPicking = false, avatarUrls = {}, nodeColors = {}, previewMode = false, focusPersonIds = [], focusRelationshipIds = [], observationChapter, layoutAction, onLayoutChange, onExporterReady }: GraphCanvasProps) {
+export function GraphCanvas({ project, selectedId, onSelect, onMove, onConnect, onMarqueeSelect, marqueePersonIds = [], marqueeRelationshipIds = [], previewKind, relationshipKind, endpointPicking = false, avatarUrls = {}, nodeColors = {}, previewMode = false, focusPersonIds = [], focusRelationshipIds = [], observationChapter, layoutAction, onLayoutChange, onExporterReady }: GraphCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cyRef = useRef<Core | null>(null);
   const initialProjectRef = useRef(project);
   const initialAvatarUrlsRef = useRef(avatarUrls);
   const initialNodeColorsRef = useRef(nodeColors);
-  const callbacksRef = useRef({ onSelect, onMove, onConnect, onLayoutChange });
+  const callbacksRef = useRef({ onSelect, onMove, onConnect, onMarqueeSelect, onLayoutChange });
   const relationshipKindRef = useRef(relationshipKind);
   const previewModeRef = useRef(previewMode);
   const lastLayoutActionRef = useRef<number | undefined>(undefined);
   const collisionLayoutRef = useRef<Record<string, { x: number; y: number }>>({});
+  const marqueeSelectionRef = useRef({ personIds: marqueePersonIds, relationshipIds: marqueeRelationshipIds });
+  const renderMarqueeOutlinesRef = useRef<(() => void) | undefined>(undefined);
   useLayoutEffect(() => {
     relationshipKindRef.current = relationshipKind;
     previewModeRef.current = previewMode;
   }, [previewMode, relationshipKind]);
   useEffect(() => {
-    callbacksRef.current = { onSelect, onMove, onConnect, onLayoutChange };
-  }, [onConnect, onLayoutChange, onMove, onSelect]);
+    callbacksRef.current = { onSelect, onMove, onConnect, onMarqueeSelect, onLayoutChange };
+  }, [onConnect, onLayoutChange, onMarqueeSelect, onMove, onSelect]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -66,9 +71,15 @@ export function GraphCanvas({ project, selectedId, onSelect, onMove, onConnect, 
       event.stopPropagation();
       event.stopImmediatePropagation();
     };
+    const globalContextMenu = (event: MouseEvent) => {
+      // Chromium may dispatch contextmenu from its canvas layer instead of the original target.
+      // Preventing at document-capture is the only reliable way to keep right-drag inside the editor.
+      event.preventDefault();
+    };
     container.addEventListener("pointerdown", interceptRightPointerDown, true);
     container.addEventListener("mousedown", blockRightMouseDown, true);
     container.addEventListener("contextmenu", contextMenu, true);
+    document.addEventListener("contextmenu", globalContextMenu, true);
     const cy = cytoscape({
       container,
       elements: toGraphElements(initialProjectRef.current, "all", initialAvatarUrlsRef.current, initialNodeColorsRef.current),
@@ -92,6 +103,8 @@ export function GraphCanvas({ project, selectedId, onSelect, onMove, onConnect, 
         { selector: ".preview-focused", style: { opacity: 1, "text-opacity": 1, "z-index": 10 } },
         { selector: ".search-dimmed", style: { opacity: 0.12, "text-opacity": 0.16 } },
         { selector: ".search-focused", style: { opacity: 1, "text-opacity": 1, "z-index": 12 } },
+        { selector: ".marquee-relation-selected", style: { width: "4px", "line-color": "#8a3ffc", "target-arrow-color": "#8a3ffc", "source-arrow-color": "#8a3ffc", "z-index": 30 } },
+
         { selector: ":selected", style: { "border-color": "#6157d8", "border-width": "5px", "line-color": "#6157d8", "target-arrow-color": "#6157d8" } },
       ],
       layout: { name: "circle", padding: 90 },
@@ -142,9 +155,50 @@ export function GraphCanvas({ project, selectedId, onSelect, onMove, onConnect, 
     connectionLine.setAttribute("stroke-dasharray", "9 7");
     connectionLine.setAttribute("marker-end", "url(#connection-preview-arrow)");
     connectionLine.setAttribute("visibility", "hidden");
-    connectionOverlay.append(definitions, connectionLine);
+    const marqueeOutlines = document.createElementNS(svgNamespace, "g");
+    marqueeOutlines.setAttribute("data-role", "marquee-outlines");
+    const marqueeBox = document.createElementNS(svgNamespace, "rect");
+    marqueeBox.setAttribute("visibility", "hidden");
+    marqueeBox.setAttribute("fill", "#8a3ffc");
+    marqueeBox.setAttribute("fill-opacity", "0.12");
+    marqueeBox.setAttribute("stroke", "#8a3ffc");
+    marqueeBox.setAttribute("stroke-width", "2");
+    marqueeBox.setAttribute("stroke-dasharray", "9 6");
+    const marqueeAnimation = document.createElementNS(svgNamespace, "animate");
+    marqueeAnimation.setAttribute("attributeName", "stroke-dashoffset");
+    marqueeAnimation.setAttribute("from", "0");
+    marqueeAnimation.setAttribute("to", "-15");
+    marqueeAnimation.setAttribute("dur", "0.55s");
+    marqueeAnimation.setAttribute("repeatCount", "indefinite");
+    marqueeBox.append(marqueeAnimation);
+    connectionOverlay.append(definitions, connectionLine, marqueeBox, marqueeOutlines);
+    const renderMarqueeOutlines = () => {
+      marqueeOutlines.replaceChildren();
+      const ids = marqueeSelectionRef.current.personIds;
+      ids.forEach((id) => {
+        const element = cy.getElementById(id);
+        if (element.empty()) return;
+        const bounds = element.renderedBoundingBox({ includeLabels: true });
+        const padding = element.isNode() ? 9 : 6;
+        const outline = document.createElementNS(svgNamespace, "rect");
+        outline.setAttribute("x", String(bounds.x1 - padding));
+        outline.setAttribute("y", String(bounds.y1 - padding));
+        outline.setAttribute("width", String(Math.max(1, bounds.w + padding * 2)));
+        outline.setAttribute("height", String(Math.max(1, bounds.h + padding * 2)));
+        outline.setAttribute("rx", "3");
+        outline.setAttribute("fill", "none");
+        outline.setAttribute("stroke", "#8a3ffc");
+        outline.setAttribute("stroke-width", "2");
+        outline.setAttribute("stroke-dasharray", "7 5");
+        marqueeOutlines.append(outline);
+      });
+    };
+    renderMarqueeOutlinesRef.current = renderMarqueeOutlines;
+    cy.on("render", renderMarqueeOutlines);
     container.append(connectionOverlay);
     let connectionSourceId: string | undefined;
+    let marqueeStart: { x: number; y: number } | undefined;
+    let marqueeAdditive = false;
     let connectionSourcePosition: { x: number; y: number } | undefined;
     cy.on("tap", (event: EventObject) => callbacksRef.current.onSelect(event.target === cy ? undefined : event.target.id()));
     cy.on("drag", "node", (event: EventObject) => {
@@ -211,19 +265,29 @@ export function GraphCanvas({ project, selectedId, onSelect, onMove, onConnect, 
       }).first() as NodeSingular;
     };
     const rightPointerDown = (event: PointerEvent) => {
-      if (event.button !== 2) return;
-      if (previewModeRef.current) return;
-      if (!connectionSourceId) {
-        const source = nodeAt(event);
-        if (source && !source.empty()) beginConnection(source.id());
+      if (event.button !== 2 || previewModeRef.current) return;
+      const target = nodeAt(event, connectionSourceId, 36);
+      if (connectionSourceId) {
+        if (target && !target.empty()) callbacksRef.current.onConnect(connectionSourceId, target.id(), relationshipKindRef.current);
+        clearConnectionPreview();
         return;
       }
-      const target = nodeAt(event, connectionSourceId, 36);
-      if (target && !target.empty()) callbacksRef.current.onConnect(connectionSourceId, target.id(), relationshipKindRef.current);
-      clearConnectionPreview();
+      const source = nodeAt(event);
+      if (source && !source.empty()) { beginConnection(source.id()); return; }
+      const rect = container.getBoundingClientRect();
+      marqueeStart = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      marqueeAdditive = event.ctrlKey;
+      marqueeBox.setAttribute("x", String(marqueeStart.x)); marqueeBox.setAttribute("y", String(marqueeStart.y));
+      marqueeBox.setAttribute("width", "0"); marqueeBox.setAttribute("height", "0"); marqueeBox.setAttribute("visibility", "visible");
     };
     handleRightPointerDown = rightPointerDown;
-    const pointerMove = (event: MouseEvent) => {
+    const pointerMove = (event: PointerEvent) => {
+      if (marqueeStart) {
+        const rect = container.getBoundingClientRect(); const x = event.clientX - rect.left; const y = event.clientY - rect.top;
+        marqueeBox.setAttribute("x", String(Math.min(marqueeStart.x, x))); marqueeBox.setAttribute("y", String(Math.min(marqueeStart.y, y)));
+        marqueeBox.setAttribute("width", String(Math.abs(x - marqueeStart.x))); marqueeBox.setAttribute("height", String(Math.abs(y - marqueeStart.y)));
+        return;
+      }
       if (!connectionSourceId) return;
       if (connectionSourcePosition) cy.getElementById(connectionSourceId).position(connectionSourcePosition);
       const rect = containerRef.current?.getBoundingClientRect();
@@ -253,9 +317,24 @@ export function GraphCanvas({ project, selectedId, onSelect, onMove, onConnect, 
     const pointerDown = (event: MouseEvent) => {
       if (event.button === 0 && connectionSourceId) clearConnectionPreview();
     };
+    const pointerUp = (event: PointerEvent) => {
+      if (!marqueeStart) return;
+      const rect = container.getBoundingClientRect(); const end = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      const left = Math.min(marqueeStart.x, end.x); const right = Math.max(marqueeStart.x, end.x); const top = Math.min(marqueeStart.y, end.y); const bottom = Math.max(marqueeStart.y, end.y);
+      marqueeBox.setAttribute("visibility", "hidden");
+      const moved = Math.hypot(end.x - marqueeStart.x, end.y - marqueeStart.y) >= 8;
+      marqueeStart = undefined;
+      if (!moved) { marqueeAdditive = false; return; }
+      const personIds = cy.nodes().filter((node) => { const point = node.renderedPosition(); return point.x >= left && point.x <= right && point.y >= top && point.y <= bottom; }).map((node) => node.id());
+      const personSet = new Set(personIds);
+      const relationshipIds = cy.edges().filter((edge) => personSet.has(edge.source().id()) && personSet.has(edge.target().id())).map((edge) => edge.id());
+      callbacksRef.current.onMarqueeSelect?.(personIds, relationshipIds, marqueeAdditive);
+      marqueeAdditive = false;
+    };
     container.addEventListener("mousedown", pointerDown);
-    container.addEventListener("mousemove", pointerMove, true);
-    window.addEventListener("mousemove", pointerMove, true);
+    container.addEventListener("pointermove", pointerMove, true);
+    window.addEventListener("pointermove", pointerMove, true);
+    window.addEventListener("pointerup", pointerUp, true);
     cy.on("mouseover", "node", (event: EventObject) => {
       if (!previewModeRef.current) return;
       const neighborhood = event.target.closedNeighborhood();
@@ -268,17 +347,31 @@ export function GraphCanvas({ project, selectedId, onSelect, onMove, onConnect, 
     return () => {
       handleRightPointerDown = undefined;
       container.removeEventListener("contextmenu", contextMenu, true);
+      document.removeEventListener("contextmenu", globalContextMenu, true);
       container.removeEventListener("pointerdown", interceptRightPointerDown, true);
       container.removeEventListener("mousedown", blockRightMouseDown, true);
       container.removeEventListener("mousedown", pointerDown);
-      container.removeEventListener("mousemove", pointerMove, true);
-      window.removeEventListener("mousemove", pointerMove, true);
+      container.removeEventListener("pointermove", pointerMove, true);
+      window.removeEventListener("pointermove", pointerMove, true);
+      window.removeEventListener("pointerup", pointerUp, true);
+      marqueeBox.remove();
       connectionOverlay.remove();
+      renderMarqueeOutlinesRef.current = undefined;
       cy.destroy();
       cyRef.current = null;
       onExporterReady?.(undefined);
     };
   }, [onExporterReady]);
+
+  useEffect(() => {
+    marqueeSelectionRef.current = { personIds: marqueePersonIds, relationshipIds: marqueeRelationshipIds };
+    const cy = cyRef.current;
+    if (cy) {
+      cy.$(".marquee-relation-selected").removeClass("marquee-relation-selected");
+      marqueeRelationshipIds.forEach((id) => cy.getElementById(id).addClass("marquee-relation-selected"));
+    }
+    renderMarqueeOutlinesRef.current?.();
+  }, [marqueePersonIds, marqueeRelationshipIds, project]);
 
   useEffect(() => {
     previewModeRef.current = previewMode;
